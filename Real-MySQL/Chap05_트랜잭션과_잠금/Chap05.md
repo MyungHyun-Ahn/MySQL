@@ -382,3 +382,309 @@ mysql> UNLOCK TABLES;
 --// 불필요한 테이블 삭제
 mysql> DROP TABLE access_log_old;
 ~~~
+
+
+## 5.3 InnoDB 스토리지 엔진 잠금
+InnoDB 스토리지 엔진은 MySQL에서 잠금과는 별개로 레코드 기반의 잠금 방식을 탑재
+* 이것으로 훨씬 뛰어난 동시성 처리 제공
+* 하지만 이원화된 잠금 처리 탓에 MySQL 명령을 이용해 접근하기가 까다롭다.
+
+예전 버전 MySQL 서버에서 InnoDB 잠금 정보를 진단할 수 있는 도구
+* innodb_lock_monitor라는 이름의 테이블을 생성해서 잠금 정보를 덤프하는 방법
+* SHOW ENGINE INNODB STATUS 명령이 전부
+* 위 내용은 분석하기 상당히 어려웠다.
+
+최근 버전에서는 InnoDB의 트랜잭션과 잠금, 그리고 잠금 대기 중인 트랜잭션의 목록을 조회할 수 있는 방법이 도입됐다.
+* information_schema 데이터베이스에 존재하는 INNODB_TRX, INNODB_LOCK, INNODB_LOCK_WAITS 테이블을 조인에서 조회
+* Performance Schema를 이용해 InnoDB 스토리지 엔진의 내부 잠금(세마포어)에 대한 모니터링 방법도 추가
+
+### 5.3.1 InnoDB 스토리지 엔진의 잠금
+InnoDB 스토리지 엔진은 레코드 기반의 잠금 기능을 제공
+* 상당히 작은 공간으로 관리 - 레코드 락 -> 페이지 락 -> 테이블 락으로 레벨업 되는 경우는 없다.(락 에스컬레이션)
+* 레코드와 레코드 사이의 간격을 잠그는 갭(GAP) 락또 한 존재한다.
+
+![InnoDB_Lock](https://github.com/MyungHyun-Ahn/SystemProgramming/assets/78206106/ec43b4e2-ea27-4356-959e-be0181446c61)
+
+
+### 5.3.1.1 레코드 락
+레코드 락(Record lock, Record only lock)
+* 레코드 자체만을 잠그는 것 - 다른 DBMS와 동일한 역할
+* 한가지 차이 : InnoDB 스토리지 엔진은 레코드 자체가 아닌 인덱스의 레코드를 잠금
+  * 인덱스가 없더라도 자동 생성된 클러스터 인덱스을 이용해 설정
+  * 레코드를 잠그느냐와 인덱스를 잠그느냐는 중요한 차이를 만들어 냄(이후 다시 예제)
+
+InnoDB에서는 대부분 보조 인덱스를 이용한 변경 작업은
+* 넥스트 키 락 또는 갭 락 사용
+
+프라이머리 키 또는 유니크 인덱스에 의한 변경 작업은
+* 레코드 자체에 대해서만 락
+
+
+### 5.3.1.2 갭 락
+갭 락(Gap lock)
+* 레코드 자체가 아니라 레코드와 바로 인접한 레코드 사이의 간격만 잠그는 것
+* 중간에 INSERT되는 것을 제어하는 것
+* 넥스트 키 락의 일부로 자주 사용된다.
+
+### 5.3.1.3 넥스트 키 락
+넥스트 키 락(Next key lock)
+* 레코드 락과 갭 락을 합쳐 놓은 형태의 잠금
+
+STATEMENT 포맷의 바이너리 로그를 사용하는 MySQL 서버에서는 REPEATABLE READ 격리수준을 사용\
+또한 innodb_locks_unsafe_for_binlog 시스템 변수가 비활성화되면(0 설정) 변경을 위해 검색하는 레코드에는 넥스트 키 락 방식으로 잠금이 걸린다.
+
+InnoDB의 갭 락과 넥스트 키 락의 목적
+* 바이너리 로그에 기록되는 쿼리가 레플리카 서버에서 실행될 때 소스 서버에서 만들어 낸 결과와 동일한 결과를 만들어내도록 보장하는 것
+
+그런데 의외로 넥스트 키 락과 갭락으로 인해 데드락이 발생하거나 다른 트랜잭션이 대기하게 만드는 일이 자주 발생
+* 가능하면 바이너리 로그 포맷을 ROW 형태로 바꿔서 넥스트 키락과 갭 락을 줄이는 것이 좋다.
+
+MySQL8.0에서는 ROW 포맷의 바이너리 로그가 기본 설정
+
+### 5.3.1.4 자동 증가 락
+AUTO_INCREMENT라는 칼럼 속성을 지정하면 중복되지 않고 저장된 순서대로 증가하는 일련번호 값을 가지게 된다.
+* 이를 위해 내부적으로 자동 증가 락이라고 하는 테이블 수준 잠금을 사용
+
+AUTO_INCREMENT 락 특징
+* 새로운 레코드를 저장하는 쿼리에서만 필요(INSERT, REPLACE)
+* InnoDB의 다른 잠금과는 달리 AUTO_INCREMENT 값을 가져오는 순간에만 락이 걸린다.
+  * AUTO_INCREMENT의 값을 명시적으로 변경해도 걸린다.
+* AUTO_INCREMENT 락을 명시적으로 획득하고 해제하는 방법은 없다.
+* 아주 짧은 시간 적용되기 때문에 특별히 문제 생기지 않는다.
+
+지금까지의 설명은 MySQL5.0 이하 버전에서 사용되던 방식
+
+MySQL 5.1부터는 innodb_autoinc_lock_mod 시스템 변수로 작동 방식 변경 가능
+* =0 : 5.0과 동일한 잠금 방식
+* =1 : INSERT 되는 레코드 건수를 정확히 예측할 수 있으면 훨씬 가볍고 빠른 래치(뮤텍스)를 이용해 처리
+  * 래치는 자동 증가 값을 가져오는 즉시 잠금이 해제
+  * 대량의 INSERT가 수행될 때는 여러개의 자동 증가 값을 한 번에 할당받아 INSERT되는 레코드에 사용
+  * 하지만 한 번에 할당받은 값이 남는다면 폐기되고 다음 INSERT되는 레코드는 연속되지 않은 값을 가질 수 있다.
+  * 최소한 하나의 INSERT 문장으로 INSERT 되는 레코드는 연속된 자동 증가 값을 가지게 된다.
+  * 연속 모드(Consecutive mode)라고도 한다.
+* =2 : 무조건 래치(뮤텍스) 사용
+  * 연속된 자동 증가 값을 보장하진 않는다.
+  * 인터리빙 모드(Interleaced mode)라고도 한다.
+  * 대량 INSERT 문장이 실행되는 중에도 다른 커넥션에서 INSERT를 수행할 수 있다.(동시 처리 성능 높아짐)
+  * 하지만 이 설정에서 작동하는 자동 증가 기능은 유니크 값이 생성된다는 것만 보장
+
+### 5.3.2 인덱스와 잠금
+InnoDB의 잠금은 레코드를 잠그는 것이 아닌 인덱스를 잠그는 방식
+
+~~~sql
+--// 예제 데이터베이스의 employees 테이블에는 아래와 같이 first_name 칼럼만
+--// 멤버로 담긴 ix_firstname이라는 인덱스가 준비돼 있다.
+--//    KEY ix_firstname (first_name)
+--// employees 테이블에서 first_name='Georgi'인 사원은 전체 253명이 있으며,
+--// first_name='Georgi'이고 last_name='Klassen'인 사원은 딱 1명만 있는 것을
+--// 아래 쿼리로 확인할 수 있다.
+mysql> SELECT COUNT(*) FROM employees WHERE first_name='Georgi';
++----------+
+|       253|
++----------+
+
+mysql> SELECT COUNT(*) FROM employees WHERE first_name='Georgi' AND last_name='Klassen';
++----------+
+|         1|
++----------+
+
+--// employees 테이블에서 first_name='Georgi'이고 last_name='Klassen'인 사원의
+--// 입사 일자를 오늘로 변경하는 쿼리를 실행해보자.
+mysql> UPDATE employees SET hire_data=NOW() WHERE first_name='Georgi' AND last_name='Klassen';
+~~~
+위 1건의 업데이트를 위해 몇 개의 레코드에 락을 걸어야 할까?
+* 인덱스를 이용할 수 있는 조건은 first_name='Georgi'이므로 253건의 레코드에 대해 락이 걸린다.
+* 이 예제에서는 몇 건 안되는 레코드만 잠그지만, 적절한 인덱스가 준비되어 있지 않다면 동시성이 상당히 떨어질 것
+
+![index_lock](https://github.com/MyungHyun-Ahn/SystemProgramming/assets/78206106/b36d12d3-1fe4-4e2d-84a1-749ad6da3d15)
+
+테이블에 인덱스가 하나도 없다면?
+* 모든 레코드를 잠그게 된다.
+* InnoDB에서 인덱스 설계가 중요한 이유가 바로 이것
+
+### 5.3.3 레코드 수준의 잠금 확인 및 해제
+레코드 수준 잠금은 테이블 수준 잠금보다는 조금 더 복잡
+* 테이블 잠금에서는 문제의 원인이 쉽게 발견되고 해결될 수 있다.
+* 레코드 잠금에서는 그 레코드가 자주 사용되지 않는다면 오랜 시간 잠겨진 상태로 남아 있어도 발견하기 쉽지 않다.
+
+예전 버전 MySQL 서버에서는 레코드 잠금에 대한 메타 정보를 제공하지 않기 때문에 더욱 어려웠다.
+
+MySQL5.1 부터는 레코드 잠금과 잠금 대기에 대한 조회가 가능하므로 쿼리 하나로 확인할 수 있다.
+* 강제로 잠금을 해제하려면 KILL 명령을 이용해 MySQL 서버의 프로세스를 강제로 종료하면 된다.
+
+잠금 시나리오 가정
+
+![LS](https://github.com/MyungHyun-Ahn/SystemProgramming/assets/78206106/c48a5013-4329-4d52-8e6c-7cc68e16bda6)
+
+각 트랜잭션이 잠금 대기, 어떤 트랜잭션이 하고 있는지 쉽게 조회할 수 있다.
+* information_schema 라는 DB에 INNODB_TRX, INNODB_LOCKS, INNODB_LOCK_WAITS 테이블로 확인 가능 - 5.1 버전
+* 8.0 버전부터 이런 정보는 조금씩 제거되고 있다.
+* performance_schema의 data_locks와 data_lock_waits 테이블로 대체
+
+performance_schema의 data_locks 테이블과 data_lock_waits 테이블 조회하여 대기순서 조회
+~~~sql
+mysql> SELECT
+        r.trx_id waiting_trx_id,
+        r.trx_mysql_thread_id waiting_thread,
+        r.trx_query waiting_query,
+        b.trx_id blocking_trx_id,
+        b.trx_mysql_thread_id blocking_thread,
+        b.trx_query blocking_query
+       FROM performance_schema.data_lock_waits w
+       INNER JOIN information_schema.innodb_trx b
+        ON b.trx_id = w.blocking_engine_transaction_id
+       INNER JOIN information_schema.innodb_trx r
+        ON r.trx_id = w.blocking_engine_transaction_id;
+~~~
+
+위 쿼리의 실행결과를 보면 몇 번 스레드가 현재 대기 중인지 알 수 있다.\
+추가로 몇 번 스레드에 의해 대기 중인지 정보도 표시된다.
+
+만약 19번 스레드가 17번 스레드의 잠금을 기다리고 있을 때\
+17번 스레드가 어떤 잠금을 가지고 있는지 상세히 확인하고 싶다면 performance_schema의 data_locks 테이블이 가진 컬럼을 모두 확인하면 된다.
+~~~sql
+mysql> SELECT * FROM performance_schema.data_locks\G
+~~~
+
+![pl1](https://github.com/MyungHyun-Ahn/SystemProgramming/assets/78206106/ae18477f-2754-4b37-a57e-29e05e9d0dad)
+
+![pr2](https://github.com/MyungHyun-Ahn/SystemProgramming/assets/78206106/13f1de0f-787c-4d03-bd2a-dcde80554891)
+
+위 결과에서 employees 테이블에 대해 IX잠금(Intentional Exclusive)을 가지고 있으며 특정 레코드에 대해 쓰기 잠금을 가지고 있다는 것을 확인 가능
+* REC_NOT_GAP 표시로 갭이 포함되지 않은 순수 레코드에 대한 잠금을 가지고 있음을 알 수 있다.
+
+만약 이 상황에서 17번 스레드가 상당히 오래 멈춰 있었다면 강제로 종료시키면 된다.
+~~~sql
+mysql> KILL 17;
+~~~
+
+## 5.4 MySQL의 격리 수준
+트랜잭션의 격리 수준(isolation level)이란?
+* 여러 트랜잭션이 동시에 처리될 때 특정 트랜잭션이 다른 트랜잭션에게 변경하거나 조회하는 데이터를 볼 수 있게 허용 여부를 결정하는 것
+
+격리 수준 4가지
+* READ UNCOMMITTED
+  * "DIRTY READ"라고도 불린다.
+  * 일반적인 데이터베이스에서는 거의 사용하지 않는다.
+* READ COMMITTED
+* REPEATABLE READ
+* SERIALIZABLE
+  * 동시성이 중요한 데이터베이스에서는 사용되지 않는다.
+
+순서대로 뒤로 갈수록 격리 정도가 높아지며, 동시 처리 성능도 떨어지는 것이 일반적
+* SERIALIZABLE 격리 수준만 아니라면 크게 성능의 개선이나 저하는 발생하지 않는다.
+
+부정합의 문제 발생 여부
+
+![isolation_level01](https://github.com/MyungHyun-Ahn/SystemProgramming/assets/78206106/1a5fa5d4-563e-4ec3-94d2-6e1b8eab7354)
+
+일반적인 온라인 서비스 용도의 데이터베이스는 아래의 둘 중 하나를 사용
+* READ COMMITTED : 오라클에서 주로 사용
+* REPEATABLE READ : MySQL에서 주로 사용
+
+여기서 설명하는 모든 예제는 AUTOCOMMIT이 OFF인 상태에서만 테스트할 수 있다.
+* SET autocommit=OFF
+
+### 5.4.1 READ UNCOMMITTED
+
+READ UNCOMMITTED 격리 수준에서는 각 트랜잭션에서의 변경 내용이 COMMIT이나 ROLLBACK 여부에 상관없이 다른 트랜잭션에서 보인다.
+
+다른 트랜잭션이 사용자 B가 실행하는 SELECT 쿼리의 결과에 어떤 영향을 미치는지 보여주는 예제
+
+![READ_UNCOMMITTED](https://github.com/MyungHyun-Ahn/SystemProgramming/assets/78206106/c370b737-a417-4b4b-90d0-8cad05be6504)
+
+사용자 B는 사용자 A가 변경한 내용을 커밋하지 않은 상태에서도 조회가 가능하다.
+* 문제는 사용자 A가 처리 중 롤백한다해도 여전히 사용자 B는 정상적인 줄 알고 계속 처리할 것
+
+더티 리드(Dirty Read)
+* 이처럼 어떤 트랜잭션에서 처리한 작업이 완료되지 않았는데 다른 트랜잭션에서 볼 수 있는 현상
+* 이것이 허용되는 격리 수준 READ UNCOMMITTED
+* 데이터가 나타났다가 사라졌다 하는 현상을 초래 : 혼란스럽게 만든다.
+
+정합성에 문제가 많은 격리 수준이다.
+* READ COMMITTED 이상의 격리 수준을 사용할 것을 권장
+
+### 5.4.2 READ COMMITTED
+READ COMMITTED는 오라클에서 기본으로 사용되는 격리 수준
+* 온라인 서비스에서 가장 많이 선택된다.
+
+더티 리드(Dirty Read) 같은 현상은 발생하지 않는다.
+* COMMIT이 완료된 데이터만 다른 트랜잭션에서 조회 가능
+
+
+READ COMMITTED 격리 수준에서 사용자 A가 변경한 내용이 사용자 B에게 어떻게 조회되는지 보여주는 예제
+
+![READ_COMMITTED01](https://github.com/MyungHyun-Ahn/SystemProgramming/assets/78206106/69bb6c78-1f2f-4329-8a42-12f409888095)
+
+사용자 B의 SELECT 결과는 언두 영역에 백업된 레코드에서 가져온다.
+* 커밋되기 전까지 다른 트랜잭션에서 변경 내역을 조회할 수 없기 때문
+
+"NON-REPEATABLE READ"라는 부정합의 문제가 있다.
+
+"NON-REPEATABLE READ"가 왜 발생하고 어떤 문제를 만들어낼 수 있는지 보여주는 예제
+
+![READ_COMMITTED02](https://github.com/MyungHyun-Ahn/SystemProgramming/assets/78206106/4116e6e1-bb34-45ae-aa09-e00881924b03)
+
+사용자 B가 하나의 트랜잭션 내에서 똑같은 SELECT 결과를 가져와야 한다는 "REPEATABLE READ" 정합성에 어긋난다.
+* 이런 부정합은 일반적인 웹 프로그램에서는 크게 문제가 되지 않을 수 있지만
+* 하나의 트랜잭션에서 동일 데이터를 여러 번 읽고 변경하는 작업이 금전적인 처리와 연결되면 문제가 될 수 있다.
+* 중요한 것은 사용 중인 트랜잭션의 격리 수준에 의해 실행하는 SQL 문장이 어떤 결과를 가져올지 정확히 예측할 수 있어야 한다는 것
+
+트랜잭션 내에서 실행되는 SELECT와 없이 실행되는 SELECT 문장의 차이
+* READ COMMITTED 격리 수준에서
+  * 차이가 별로 없다.
+* REPEATABLE READ 격리 수준에서
+  * 트랜잭션을 시작한 상태에서 온종일 동일한 쿼리를 반복해서 실행해도 동일한 결과만 보게 된다.
+
+별로 중요해 보이지 않겠지만 이런 문제로 데이터의 정합성이 깨지고 그로 인한 버그는 찾아내기 쉽지 않다.
+
+
+### 5.4.3 REPEATABLE READ
+REPEATABLE READ는 InnoDB 스토리지 엔진에서 기본으로 사용되는 결리 수준
+* 바이너리 로그를 가진 MySQL 서버에서는 최소 REPEATABLE READ 격리 수준 이상을 사용해야 한다.
+* 부정합이 발생하지 않는다.
+
+InnoDB 스토리지 엔진은 트랜잭션이 ROLLBACK될 가능성에 대비해 변경 전 레코드를 언두(Undo) 공간에 백업해두고 실제 레코드 값을 변경한다. MVCC
+* 언두 영역의 데이터를 이용해 동일 트랜잭션 내에서는 동일한 결과를 보여줄 수 있게 보장한다.
+
+REPEATABLE READ와 READ COMMITTED의 차이는 언두 영역에 백업된 레코드의 여러 버전 중 몇 번째 이전 버전까지 찾아들어가냐이다.
+
+모든 InnoDB의 트랜잭션은 고유한 번호를 가지고 있다.
+* 언두 영역에 백업된 모든 레코드에는 이것을 포함
+
+언두 영역의 데이터는 InnoDB 스토리지 엔진이 불필요하다 판단하면 주기적으로 삭제
+* REPEATABLE READ 격리 수준에서는 MVCC를 보장하기 위해 실행 중인 트랜잭션 중 가장 오래된 트랜잭션 번호보다 트랜잭션 번호가 앞선 영역의 데이터는 삭제할 수 없다.
+* 특정 트랜잭션 번호 구간 내에 백업된 언두 데이터가 보존되어야 한다.
+
+
+REPEATABLE READ 격리 수준이 작동하는 방식
+
+![REPEATED_READ01](https://github.com/MyungHyun-Ahn/SystemProgramming/assets/78206106/2a872bd2-c02a-48b9-a179-feb3efe099c5)
+
+
+언두 영역에 백업된 데이터가 하나만 있는 것으로 표현됐지만 여러 개 존재할 수 있다.
+* 트랜잭션을 시작하고 장시간 방치하면 무한정 커질 수 있다.
+* 이 경우 MySQL 서버의 처리 성능이 떨어질 수 있다.
+
+REPEATABLE READ 격리 수준에서 발생하는 부정합
+
+![REPEATED_READ02](https://github.com/MyungHyun-Ahn/SystemProgramming/assets/78206106/227e4e67-d223-4026-be41-282273b68416)
+
+같은 트랜잭션에서 두 번의 SELECT 쿼리는 똑같아야 한다.
+* 그러나 사용자 B의 SELECT 쿼리의 결과는 서로 다르다.
+* 이렇게 데이터가 보였다 안보였다 하는 현상을 PHANTOM READ(ROW) 라고 한다.
+* 언두 레코드에는 잠금을 걸 수 없기 때문
+
+### 5.4.4 SERIALIZABLE
+가장 단순한 격리 수준이며 동시에 가장 엄격한 격리 수준
+* 그만큼 동시 처리 성능도 다른 트랜잭션 격리 수준보다 떨어짐
+
+InnoDB 테이블에서 기본적으로 순수한 SELECT 작업은 아무런 레코드 잠금도 설정하지 않고 실행
+* "Non-locking consistent read(잠금이 필요 없는 일관된 읽기)"는 이를 의미
+
+SERIALIZABLE 격리 수준에서는 이런 읽기 작업도 공유 잠금을 획득해야만 하고, 다른 트랜잭션은 변경하지 못한다.
+* 즉, 한 트랜잭션에서 읽고 쓰는 레코드를 다른 트랜잭션에서는 절대 접근할 수 없는 것
+
+PHANTOM READ 문제가 발생하지 않는다.
+* 그러나 InnoDB 스토리지 엔진에서 갭 락과 넥스트 키 락 덕분에 REPEATABLE READ 격리 수준에서도 이미 발생하지 않는다.
+* 굳이 SERIALIZABLE 격리 수준을 사용할 필요성이 없다.
